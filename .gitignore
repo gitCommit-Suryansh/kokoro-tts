@@ -1,0 +1,27 @@
+# Python
+venv/
+env/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Model weights - large binaries, Dockerfile/curl fetches these fresh, don't commit them
+models/
+*.onnx
+*.bin
+
+# Test audio output
+*.wav
+*.pcm
+
+# Logs
+*.log
+
+# Env/secrets, in case you add one later
+.env
+
+# OS/editor cruft
+.DS_Store
+.vscode/
+.idea/
