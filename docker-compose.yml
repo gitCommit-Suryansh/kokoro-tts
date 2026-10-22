@@ -4,9 +4,5 @@ services:
     container_name: kokoro_tts_service
     restart: unless-stopped
     ports:
-      - "127.0.0.1:8030:8000"   # loopback-only, same pattern as hrms (3010) and ids_fastapi_backend (8010)
-    # Optional: cap memory since the model + runtime comfortably fit under 1GB
-    # deploy:
-    #   resources:
-    #     limits:
-    #       memory: 1g
+      - "127.0.0.1:8030:8000" # loopback-only, same pattern as hrms (3010) and ids_fastapi_backend (8010)
+    cpus: "3.0" # leave at least 1 core for the other sites
