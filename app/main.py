@@ -3,13 +3,16 @@ Kokoro TTS microservice.
 
 Two endpoints:
   POST /synthesize         -> returns a complete WAV file (simple, good for testing)
-  POST /synthesize/stream  -> streams raw 16-bit PCM (24kHz, mono) chunks as they're
-                               generated, sentence by sentence, for low-latency IVR use
+  POST /synthesize/stream  -> streams raw 16-bit PCM (24kHz, mono), one sentence at a
+                               time, so the caller hears the first sentence while the
+                               rest is still being generated (low time-to-first-audio)
 
 Model loads once at startup and stays resident in memory - no per-request load cost.
 """
+import asyncio
 import io
 import os
+import re
 import time
 from contextlib import asynccontextmanager
 from typing import Optional
@@ -23,6 +26,12 @@ from kokoro_onnx import Kokoro
 
 MODEL_PATH = os.getenv("KOKORO_MODEL_PATH", "/models/kokoro-v1.0.onnx")
 VOICES_PATH = os.getenv("KOKORO_VOICES_PATH", "/models/voices-v1.0.bin")
+
+# Streaming: split on sentence ends (. ! ? and Hindi danda ।)
+SENTENCE_SPLIT = re.compile(r"(?<=[.!?।])\s+")
+CLAUSE_SPLIT = re.compile(r"(?<=[,;:])\s+")
+MAX_CHUNK_CHARS = 200          # very long sentences get broken at commas
+PAUSE_SECONDS = 0.12           # small natural gap between streamed sentences
 
 kokoro: Optional[Kokoro] = None
 
@@ -45,6 +54,28 @@ class SynthesizeRequest(BaseModel):
                                 # hf_alpha/hf_beta = HI female, hm_omega/hm_psi = HI male
     lang: str = "en-us"        # "en-us", "en-gb", or "hi" for Hindi
     speed: float = 1.0
+
+
+def split_text(text: str) -> list[str]:
+    """Split text into sentence-sized chunks; break very long sentences at commas."""
+    parts: list[str] = []
+    for sentence in SENTENCE_SPLIT.split(text.strip()):
+        sentence = sentence.strip()
+        if not sentence:
+            continue
+        if len(sentence) <= MAX_CHUNK_CHARS:
+            parts.append(sentence)
+            continue
+        buf = ""
+        for piece in CLAUSE_SPLIT.split(sentence):
+            if buf and len(buf) + len(piece) + 1 > MAX_CHUNK_CHARS:
+                parts.append(buf)
+                buf = piece
+            else:
+                buf = f"{buf} {piece}".strip()
+        if buf:
+            parts.append(buf)
+    return parts
 
 
 @app.get("/health")
@@ -81,21 +112,28 @@ def synthesize(req: SynthesizeRequest):
 @app.post("/synthesize/stream")
 async def synthesize_stream(req: SynthesizeRequest):
     """
-    Streaming: yields raw 16-bit PCM mono audio chunks as each sentence/clause
-    finishes generating, instead of waiting for the whole utterance. This is what
-    you want wired into the live call leg for low time-to-first-audio.
-
+    Streaming: generates and sends one sentence at a time.
     Output format: raw PCM, 16-bit signed little-endian, mono, 24000 Hz.
-    Point your telephony layer at that directly (same idea as Piper's --output_raw).
     """
     if kokoro is None:
         raise HTTPException(status_code=503, detail="model not loaded yet")
 
+    chunks = split_text(req.text)
+    if not chunks:
+        raise HTTPException(status_code=400, detail="text is empty")
+
     async def pcm_chunks():
-        async for samples, sample_rate in kokoro.create_stream(
-            req.text, voice=req.voice, speed=req.speed, lang=req.lang
-        ):
+        for i, chunk in enumerate(chunks):
+            samples, sample_rate = await asyncio.to_thread(
+                kokoro.create, chunk, voice=req.voice, speed=req.speed, lang=req.lang
+            )
             pcm16 = (np.clip(samples, -1.0, 1.0) * 32767).astype(np.int16)
             yield pcm16.tobytes()
+            if i < len(chunks) - 1:
+                yield np.zeros(int(PAUSE_SECONDS * sample_rate), dtype=np.int16).tobytes()
 
-    return StreamingResponse(pcm_chunks(), media_type="application/octet-stream")
+    return StreamingResponse(
+        pcm_chunks(),
+        media_type="application/octet-stream",
+        headers={"X-Accel-Buffering": "no"},
+    )
