@@ -8,6 +8,12 @@ Two endpoints:
                                rest is still being generated (low time-to-first-audio)
 
 Model loads once at startup and stays resident in memory - no per-request load cost.
+
+CPU tuning:
+  - ONNX Runtime threads are pinned to TTS_THREADS (match the container's CPU cap)
+    and thread spinning is disabled, so idle threads don't burn CPU.
+  - Generation runs one sentence at a time behind a FIFO lock. Concurrent calls take
+    turns sentence-by-sentence, each getting the full CPU, instead of fighting over it.
 """
 import asyncio
 import io
@@ -18,6 +24,7 @@ from contextlib import asynccontextmanager
 from typing import Optional
 
 import numpy as np
+import onnxruntime as ort
 import soundfile as sf
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
@@ -26,6 +33,7 @@ from kokoro_onnx import Kokoro
 
 MODEL_PATH = os.getenv("KOKORO_MODEL_PATH", "/models/kokoro-v1.0.onnx")
 VOICES_PATH = os.getenv("KOKORO_VOICES_PATH", "/models/voices-v1.0.bin")
+TTS_THREADS = int(os.getenv("TTS_THREADS", "3"))   # keep equal to `cpus` in docker-compose
 
 # Streaming: split on sentence ends (. ! ? and Hindi danda ।)
 SENTENCE_SPLIT = re.compile(r"(?<=[.!?।])\s+")
@@ -34,14 +42,30 @@ MAX_CHUNK_CHARS = 200          # very long sentences get broken at commas
 PAUSE_SECONDS = 0.12           # small natural gap between streamed sentences
 
 kokoro: Optional[Kokoro] = None
+tts_lock = asyncio.Lock()      # FIFO: concurrent requests take turns per sentence
+
+
+def build_kokoro() -> Kokoro:
+    opts = ort.SessionOptions()
+    opts.intra_op_num_threads = TTS_THREADS
+    opts.inter_op_num_threads = 1
+    opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+    opts.add_session_config_entry("session.intra_op.allow_spinning", "0")
+    session = ort.InferenceSession(
+        MODEL_PATH, sess_options=opts, providers=["CPUExecutionProvider"]
+    )
+    return Kokoro.from_session(session, VOICES_PATH)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global kokoro
     t0 = time.time()
-    kokoro = Kokoro(MODEL_PATH, VOICES_PATH)
-    print(f"Kokoro model loaded in {time.time() - t0:.2f}s from {MODEL_PATH}")
+    kokoro = build_kokoro()
+    print(
+        f"Kokoro model loaded in {time.time() - t0:.2f}s from {MODEL_PATH} "
+        f"(threads={TTS_THREADS})"
+    )
     yield
 
 
@@ -78,21 +102,29 @@ def split_text(text: str) -> list[str]:
     return parts
 
 
+async def generate(text: str, voice: str, speed: float, lang: str):
+    """Run one generation with the full CPU, waiting our turn if another is running."""
+    async with tts_lock:
+        return await asyncio.to_thread(
+            kokoro.create, text, voice=voice, speed=speed, lang=lang
+        )
+
+
 @app.get("/health")
 def health():
     return {"status": "ok", "model_loaded": kokoro is not None}
 
 
 @app.post("/synthesize")
-def synthesize(req: SynthesizeRequest):
+async def synthesize(req: SynthesizeRequest):
     """Non-streaming: returns one complete WAV file. Good for quick curl/Postman tests."""
     if kokoro is None:
         raise HTTPException(status_code=503, detail="model not loaded yet")
+    if not req.text.strip():
+        raise HTTPException(status_code=400, detail="text is empty")
 
     t0 = time.time()
-    samples, sample_rate = kokoro.create(
-        req.text, voice=req.voice, speed=req.speed, lang=req.lang
-    )
+    samples, sample_rate = await generate(req.text, req.voice, req.speed, req.lang)
     gen_time = time.time() - t0
 
     buf = io.BytesIO()
@@ -124,9 +156,7 @@ async def synthesize_stream(req: SynthesizeRequest):
 
     async def pcm_chunks():
         for i, chunk in enumerate(chunks):
-            samples, sample_rate = await asyncio.to_thread(
-                kokoro.create, chunk, voice=req.voice, speed=req.speed, lang=req.lang
-            )
+            samples, sample_rate = await generate(chunk, req.voice, req.speed, req.lang)
             pcm16 = (np.clip(samples, -1.0, 1.0) * 32767).astype(np.int16)
             yield pcm16.tobytes()
             if i < len(chunks) - 1:
