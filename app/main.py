@@ -164,6 +164,6 @@ async def synthesize_stream(req: SynthesizeRequest):
 
     return StreamingResponse(
         pcm_chunks(),
-        media_type="applicaton/octet-stream",
+        media_type="application/octet-stream",
         headers={"X-Accel-Buffering": "no"},
     )
